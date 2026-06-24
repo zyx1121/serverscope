@@ -3,6 +3,7 @@ package tw.zyx.serverscope.core;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.trace.Span;
@@ -22,9 +23,16 @@ import java.time.Duration;
  * -> no ServiceLoader surprises), OTLP/HTTP over the JDK sender (no okhttp/kotlin).
  *
  * Three signal types:
- *   - event(name[,attr]) : discrete low-freq -> span + counted
- *   - count(name, type)  : high-freq         -> counter only (no span flood)
- *   - sampleTick/Counts  : gauges            -> async, read latest sampled values
+ *   - event(name)              : discrete, no detail   -> span + counter(event=name)
+ *   - event(name, type, kv...) : discrete with detail  -> span carries every kv pair
+ *                                (full detail, queryable in traces); counter carries
+ *                                only the name + optional low-cardinality type label
+ *   - count(name, type)        : high-freq             -> counter only (no span flood)
+ *   - sampleTick/Counts        : gauges                -> async, read latest sampled values
+ *
+ * Cardinality rule: high-cardinality values (player names, advancement ids, coords,
+ * free text such as commands/death messages) go ONLY onto spans. Metric labels stay
+ * low-cardinality (event name + a bounded `type`) so the metrics backend never blows up.
  */
 public final class Telemetry {
     private static final AttributeKey<String> EVENT = AttributeKey.stringKey("event");
@@ -90,13 +98,25 @@ public final class Telemetry {
         if (eventCounter != null) eventCounter.add(1, Attributes.of(EVENT, name));
     }
 
-    /** discrete event with one attribute -> span (attributed) + counter */
-    public static void event(String name, String attrKey, String attrVal) {
+    /**
+     * discrete event with rich detail. The span carries every {@code kv} pair (full
+     * detail, queryable in traces); the counter carries only the event name plus an
+     * optional low-cardinality {@code metricType} label, so high-cardinality values
+     * (names, ids, coords, free text) never reach the metrics backend. {@code kv} is a
+     * flat key,value,key,value... list; null keys or values are skipped.
+     */
+    public static void event(String name, String metricType, String... kv) {
         if (tracer != null) {
-            tracer.spanBuilder(name).setAttribute(attrKey, attrVal).startSpan().end();
+            var span = tracer.spanBuilder(name);
+            for (int i = 0; i + 1 < kv.length; i += 2) {
+                if (kv[i] != null && kv[i + 1] != null) span.setAttribute(kv[i], kv[i + 1]);
+            }
+            span.startSpan().end();
         }
         if (eventCounter != null) {
-            eventCounter.add(1, Attributes.of(EVENT, name, AttributeKey.stringKey(attrKey), attrVal));
+            AttributesBuilder b = Attributes.builder().put(EVENT, name);
+            if (metricType != null) b.put(TYPE, metricType);
+            eventCounter.add(1, b.build());
         }
     }
 

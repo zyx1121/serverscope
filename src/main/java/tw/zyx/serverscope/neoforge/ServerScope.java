@@ -4,11 +4,17 @@ import org.slf4j.Logger;
 
 import com.mojang.logging.LogUtils;
 
+import net.minecraft.advancements.AdvancementHolder;
+import net.minecraft.advancements.DisplayInfo;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModContainer;
@@ -16,6 +22,7 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.CommandEvent;
 import net.neoforged.neoforge.event.ServerChatEvent;
+import net.neoforged.neoforge.event.StatAwardEvent;
 import net.neoforged.neoforge.event.entity.living.FinalizeSpawnEvent;
 import net.neoforged.neoforge.event.entity.living.LivingDamageEvent;
 import net.neoforged.neoforge.event.entity.living.LivingDeathEvent;
@@ -75,45 +82,82 @@ public class ServerScope {
     // ---- player lifecycle (discrete) ----
     @SubscribeEvent
     public void onJoin(PlayerEvent.PlayerLoggedInEvent e) {
-        Telemetry.event("player.join", "player.name", e.getEntity().getName().getString());
+        Telemetry.event("player.join", null, "player.name", e.getEntity().getName().getString());
     }
 
     @SubscribeEvent
     public void onLeave(PlayerEvent.PlayerLoggedOutEvent e) {
-        Telemetry.event("player.leave", "player.name", e.getEntity().getName().getString());
+        Telemetry.event("player.leave", null, "player.name", e.getEntity().getName().getString());
     }
 
     @SubscribeEvent
     public void onRespawn(PlayerEvent.PlayerRespawnEvent e) {
-        Telemetry.event("player.respawn", "player.name", e.getEntity().getName().getString());
+        Telemetry.event("player.respawn", null, "player.name", e.getEntity().getName().getString());
     }
 
     @SubscribeEvent
     public void onDimension(PlayerEvent.PlayerChangedDimensionEvent e) {
-        Telemetry.event("player.dimension", "to", e.getTo().location().toString());
+        Telemetry.event("player.dimension", null,
+                "player.name", e.getEntity().getName().getString(),
+                "from", e.getFrom().location().toString(),
+                "to", e.getTo().location().toString());
     }
 
     // ---- activity (discrete) ----
     @SubscribeEvent
     public void onChat(ServerChatEvent e) {
-        Telemetry.event("chat", "player.name", e.getPlayer().getName().getString());
+        Telemetry.event("chat", null, "player.name", e.getPlayer().getName().getString());
     }
 
     @SubscribeEvent
     public void onCommand(CommandEvent e) {
-        Telemetry.event("command", "command", e.getParseResults().getReader().getString());
+        CommandSourceStack src = e.getParseResults().getContext().getSource();
+        // command text is high-cardinality -> span only; counter just counts commands
+        Telemetry.event("command", null,
+                "command", e.getParseResults().getReader().getString(),
+                "actor", src.getTextName(),
+                "dimension", src.getLevel().dimension().location().toString());
     }
 
     @SubscribeEvent
     public void onAdvancement(AdvancementEvent.AdvancementEarnEvent e) {
-        Telemetry.event("advancement", "player.name", e.getEntity().getName().getString());
+        AdvancementHolder adv = e.getAdvancement();
+        var display = adv.value().display();
+        if (display.isEmpty()) {
+            return; // recipe-unlock advancements have no display -> not a real achievement, skip the noise
+        }
+        DisplayInfo d = display.get();
+        Telemetry.event("advancement", d.getType().getSerializedName(),
+                "player.name", e.getEntity().getName().getString(),
+                "advancement.id", adv.id().toString(),
+                "advancement.title", d.getTitle().getString(),
+                "advancement.type", d.getType().getSerializedName());
     }
 
     // ---- death (discrete) ----
     @SubscribeEvent
     public void onDeath(LivingDeathEvent e) {
-        if (e.getEntity() instanceof Player p) {
-            Telemetry.event("player.death", "player.name", p.getName().getString());
+        DamageSource src = e.getSource();
+        String cause = src.getMsgId();
+        LivingEntity victim = e.getEntity();
+        if (victim instanceof Player p) {
+            Entity killer = src.getEntity();
+            ItemStack weapon = src.getWeaponItem();
+            Telemetry.event("player.death", cause,
+                    "player.name", p.getName().getString(),
+                    "cause", cause,
+                    "message", src.getLocalizedDeathMessage(p).getString(),
+                    "dimension", p.level().dimension().location().toString(),
+                    "x", Integer.toString(p.blockPosition().getX()),
+                    "y", Integer.toString(p.blockPosition().getY()),
+                    "z", Integer.toString(p.blockPosition().getZ()),
+                    "killer", killer == null ? null
+                            : BuiltInRegistries.ENTITY_TYPE.getKey(killer.getType()).toString(),
+                    "weapon", weapon.isEmpty() ? null
+                            : BuiltInRegistries.ITEM.getKey(weapon.getItem()).toString());
+        } else {
+            // mobs die constantly -> counter only, keyed by victim type (mirrors mob.spawn)
+            Telemetry.count("mob.death", BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType()).toString());
         }
     }
 
@@ -143,6 +187,13 @@ public class ServerScope {
     @SubscribeEvent
     public void onDamage(LivingDamageEvent.Post e) {
         Telemetry.count("damage", BuiltInRegistries.ENTITY_TYPE.getKey(e.getEntity().getType()).toString());
+    }
+
+    // every vanilla stat increment (distance, jumps, mob kills, play time, item use, ...);
+    // fires very frequently -> counter only, keyed by stat name (bounded set, no span flood)
+    @SubscribeEvent
+    public void onStat(StatAwardEvent e) {
+        Telemetry.count("stat", e.getStat().getName());
     }
 
     // ---- gauge sampling: ServerTickEvent.Post, once per second (every 20 ticks) ----
