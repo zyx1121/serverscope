@@ -137,27 +137,34 @@ public class ServerScope {
     // ---- death (discrete) ----
     @SubscribeEvent
     public void onDeath(LivingDeathEvent e) {
-        DamageSource src = e.getSource();
-        String cause = src.getMsgId();
-        LivingEntity victim = e.getEntity();
-        if (victim instanceof Player p) {
-            Entity killer = src.getEntity();
-            ItemStack weapon = src.getWeaponItem();
-            Telemetry.event("player.death", cause,
-                    "player.name", p.getName().getString(),
-                    "cause", cause,
-                    "message", src.getLocalizedDeathMessage(p).getString(),
-                    "dimension", p.level().dimension().location().toString(),
-                    "x", Integer.toString(p.blockPosition().getX()),
-                    "y", Integer.toString(p.blockPosition().getY()),
-                    "z", Integer.toString(p.blockPosition().getZ()),
-                    "killer", killer == null ? null
-                            : BuiltInRegistries.ENTITY_TYPE.getKey(killer.getType()).toString(),
-                    "weapon", weapon.isEmpty() ? null
-                            : BuiltInRegistries.ITEM.getKey(weapon.getItem()).toString());
-        } else {
-            // mobs die constantly -> counter only, keyed by victim type (mirrors mob.spawn)
-            Telemetry.count("mob.death", BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType()).toString());
+        // telemetry must never crash a server tick: this handler reads an arbitrary
+        // mod's DamageSource, so swallow anything rather than propagate into die().
+        try {
+            DamageSource src = e.getSource();
+            String cause = src.getMsgId();
+            LivingEntity victim = e.getEntity();
+            if (victim instanceof Player p) {
+                Entity killer = src.getEntity();
+                // getWeaponItem() is @Nullable (env/melee/explosion deaths have no weapon)
+                ItemStack weapon = src.getWeaponItem();
+                Telemetry.event("player.death", cause,
+                        "player.name", p.getName().getString(),
+                        "cause", cause,
+                        "message", src.getLocalizedDeathMessage(p).getString(),
+                        "dimension", p.level().dimension().location().toString(),
+                        "x", Integer.toString(p.blockPosition().getX()),
+                        "y", Integer.toString(p.blockPosition().getY()),
+                        "z", Integer.toString(p.blockPosition().getZ()),
+                        "killer", killer == null ? null
+                                : BuiltInRegistries.ENTITY_TYPE.getKey(killer.getType()).toString(),
+                        "weapon", weapon == null || weapon.isEmpty() ? null
+                                : BuiltInRegistries.ITEM.getKey(weapon.getItem()).toString());
+            } else {
+                // mobs die constantly -> counter only, keyed by victim type (mirrors mob.spawn)
+                Telemetry.count("mob.death", BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType()).toString());
+            }
+        } catch (Exception ex) {
+            LOGGER.warn("[serverscope] onDeath telemetry failed", ex);
         }
     }
 
