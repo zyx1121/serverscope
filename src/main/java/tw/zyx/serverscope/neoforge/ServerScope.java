@@ -71,7 +71,7 @@ public class ServerScope {
         Map<String, String> resource = new LinkedHashMap<>();
         resource.put("service.name", MODID);
         resource.put("service.version", modVersion);
-        resource.put("mc.version", SharedConstants.VERSION_STRING);
+        resource.put("mc.version", SharedConstants.getCurrentVersion().getName());
         resource.put("mc.loader", "neoforge");
         Telemetry.init(resource); // emits server.starting
 
