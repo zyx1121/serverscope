@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 
 import com.mojang.logging.LogUtils;
 
+import net.minecraft.SharedConstants;
 import net.minecraft.advancements.AdvancementHolder;
 import net.minecraft.advancements.DisplayInfo;
 import net.minecraft.commands.CommandSourceStack;
@@ -36,6 +37,9 @@ import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import tw.zyx.serverscope.core.Telemetry;
 
 /**
@@ -52,8 +56,10 @@ public class ServerScope {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     private int tickCounter = 0;
+    private final String modVersion;
 
     public ServerScope(IEventBus modEventBus, ModContainer modContainer) {
+        this.modVersion = modContainer.getModInfo().getVersion().toString();
         NeoForge.EVENT_BUS.register(this);
         LOGGER.info("[serverscope] loaded");
     }
@@ -61,7 +67,96 @@ public class ServerScope {
     // ---- server lifecycle (discrete) ----
     @SubscribeEvent
     public void onStarting(ServerStartingEvent e) {
-        Telemetry.init(); // emits server.starting
+        MinecraftServer server = e.getServer();
+        Map<String, String> resource = new LinkedHashMap<>();
+        resource.put("service.name", MODID);
+        resource.put("service.version", modVersion);
+        resource.put("mc.version", SharedConstants.VERSION_STRING);
+        resource.put("mc.loader", "neoforge");
+        Telemetry.init(resource); // emits server.starting
+
+        // before marking this run live, report whether the previous run died unclean
+        detectPreviousCrash(server);
+        writeState(server, "running");
+    }
+
+    // ---- crash / unclean-restart detection -------------------------------------------
+    // A state file records "running" while up and "stopped" on a clean shutdown. If we
+    // boot and find it still "running", the previous run was killed (watchdog hang, OOM,
+    // SIGKILL...) -> emit server.unclean_restart, enriched with the crash report MC left.
+    private java.nio.file.Path stateFile(MinecraftServer server) {
+        return server.getServerDirectory().resolve("serverscope-state.txt");
+    }
+
+    private void writeState(MinecraftServer server, String status) {
+        try {
+            java.nio.file.Files.writeString(stateFile(server),
+                    status + " " + System.currentTimeMillis());
+        } catch (Exception ex) {
+            LOGGER.warn("[serverscope] state write failed", ex);
+        }
+    }
+
+    private void detectPreviousCrash(MinecraftServer server) {
+        try {
+            java.nio.file.Path state = stateFile(server);
+            if (!java.nio.file.Files.exists(state)) {
+                return; // first run, nothing to compare against
+            }
+            String[] parts = java.nio.file.Files.readString(state).trim().split("\\s+");
+            boolean wasRunning = parts.length >= 1 && "running".equals(parts[0]);
+            long lastStart = 0;
+            if (parts.length >= 2) {
+                try {
+                    lastStart = Long.parseLong(parts[1]);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (!wasRunning) {
+                return; // previous run shut down cleanly
+            }
+
+            // find the newest crash report from the previous run, if it left one
+            String reportName = null;
+            String reason = null;
+            java.nio.file.Path crashDir = server.getServerDirectory().resolve("crash-reports");
+            if (java.nio.file.Files.isDirectory(crashDir)) {
+                java.nio.file.Path newest = null;
+                long newestMs = lastStart;
+                try (var stream = java.nio.file.Files.newDirectoryStream(crashDir, "crash-*-server.txt")) {
+                    for (java.nio.file.Path p : stream) {
+                        long mtime = java.nio.file.Files.getLastModifiedTime(p).toMillis();
+                        if (mtime >= newestMs) {
+                            newestMs = mtime;
+                            newest = p;
+                        }
+                    }
+                }
+                if (newest != null) {
+                    reportName = newest.getFileName().toString();
+                    reason = crashDescription(newest);
+                }
+            }
+            // null kv pairs are dropped by Telemetry.event -> OOM/SIGKILL (no report) still emits
+            Telemetry.event("server.unclean_restart", null,
+                    "crash.report", reportName,
+                    "crash.reason", reason);
+            LOGGER.warn("[serverscope] previous run did not shut down cleanly (report={}, reason={})",
+                    reportName, reason);
+        } catch (Exception ex) {
+            LOGGER.warn("[serverscope] crash detection failed", ex);
+        }
+    }
+
+    private String crashDescription(java.nio.file.Path crash) {
+        try (var lines = java.nio.file.Files.lines(crash)) {
+            return lines.filter(l -> l.startsWith("Description:"))
+                    .map(l -> l.substring("Description:".length()).trim())
+                    .findFirst()
+                    .orElse(null);
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     @SubscribeEvent
@@ -72,6 +167,7 @@ public class ServerScope {
     @SubscribeEvent
     public void onStopping(ServerStoppingEvent e) {
         Telemetry.event("server.stopping");
+        writeState(e.getServer(), "stopped"); // clean shutdown -> next boot won't flag a crash
     }
 
     @SubscribeEvent

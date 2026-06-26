@@ -13,10 +13,15 @@ import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
+import io.opentelemetry.sdk.resources.Resource;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
 import java.time.Duration;
+import java.util.Map;
 
 /**
  * Platform-agnostic telemetry core. Hand-built OpenTelemetry SDK (no autoconfigure
@@ -50,16 +55,23 @@ public final class Telemetry {
 
     private Telemetry() {}
 
-    public static synchronized void init() {
+    public static synchronized void init(Map<String, String> resource) {
         if (tracer != null) return;
         final String base = "http://127.0.0.1:4318";
 
+        // identify this server in the backend (service.name, mc.version, loader, ...)
+        AttributesBuilder rb = Attributes.builder();
+        if (resource != null) resource.forEach(rb::put);
+        Resource res = Resource.getDefault().merge(Resource.create(rb.build()));
+
         SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+                .setResource(res)
                 .addSpanProcessor(SimpleSpanProcessor.create(
                         OtlpHttpSpanExporter.builder().setEndpoint(base + "/v1/traces").build()))
                 .build();
 
         SdkMeterProvider meterProvider = SdkMeterProvider.builder()
+                .setResource(res)
                 .registerMetricReader(PeriodicMetricReader.builder(
                                 OtlpHttpMetricExporter.builder().setEndpoint(base + "/v1/metrics").build())
                         .setInterval(Duration.ofSeconds(10))
@@ -88,6 +100,21 @@ public final class Telemetry {
                 .buildWithCallback(m -> m.record(loadedEntities));
         meter.gaugeBuilder("serverscope.chunks").ofLongs()
                 .buildWithCallback(m -> m.record(loadedChunks));
+
+        // JVM health — heap pressure + GC are the first thing to watch when a server
+        // starts to lag or OOMs; read live from java.lang.management (no game state).
+        MemoryMXBean memBean = ManagementFactory.getMemoryMXBean();
+        meter.gaugeBuilder("serverscope.jvm.heap.used").setUnit("By").ofLongs()
+                .buildWithCallback(m -> m.record(memBean.getHeapMemoryUsage().getUsed()));
+        meter.gaugeBuilder("serverscope.jvm.heap.committed").setUnit("By").ofLongs()
+                .buildWithCallback(m -> m.record(memBean.getHeapMemoryUsage().getCommitted()));
+        meter.gaugeBuilder("serverscope.jvm.heap.max").setUnit("By").ofLongs()
+                .buildWithCallback(m -> m.record(memBean.getHeapMemoryUsage().getMax()));
+        // GC counters are monotonic totals across all collectors; dashboard derives the rate
+        meter.gaugeBuilder("serverscope.jvm.gc.count").ofLongs()
+                .buildWithCallback(m -> m.record(gcTotal(true)));
+        meter.gaugeBuilder("serverscope.jvm.gc.time").setUnit("ms").ofLongs()
+                .buildWithCallback(m -> m.record(gcTotal(false)));
 
         event("server.starting");
     }
@@ -137,5 +164,15 @@ public final class Telemetry {
         onlinePlayers = players;
         loadedEntities = entities;
         loadedChunks = chunks;
+    }
+
+    /** sum GC invocation count ({@code count=true}) or accumulated pause time in ms across all collectors */
+    private static long gcTotal(boolean count) {
+        long total = 0;
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            long v = count ? gc.getCollectionCount() : gc.getCollectionTime();
+            if (v > 0) total += v; // -1 = unsupported by this collector
+        }
+        return total;
     }
 }
